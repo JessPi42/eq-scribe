@@ -180,6 +180,7 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String>
     store.save().map_err(|e| e.to_string())?;
 
     let engine_opt = {
+        let state: State<Arc<Mutex<AppState>>> = app.state();
         let st = state.lock().unwrap();
         st.sync_engine.clone()
     };
@@ -217,7 +218,8 @@ async fn test_connection(api_key: String, api_base_url: String) -> Result<serde_
 #[tauri::command]
 async fn get_status(app: AppHandle) -> AppStatus {
     let (watching, current_zone, connected, engine_opt) = {
-        let st = app.state::<Arc<Mutex<AppState>>>().lock().unwrap();
+        let state = app.state::<Arc<Mutex<AppState>>>();
+        let st = state.lock().unwrap();
         let watching = st.watcher.lock().unwrap().watching;
         let current_zone = st.watcher.lock().unwrap().current_zone.clone();
         let connected = st.connected;
@@ -319,11 +321,16 @@ async fn start_watching(app: AppHandle, log_path: String) -> Result<(), String> 
                 break;
             }
             if let Ok(mut file) = File::open(&path_for_task) {
-                let mut current_pos = pos_for_task.lock().unwrap();
-                if file.seek(SeekFrom::Start(*current_pos)).is_ok() {
+                // Collect new events inside a block so the MutexGuard on
+                // current_pos is dropped before any .await calls below.
+                let new_events: Vec<ParsedEvent> = {
+                    let mut current_pos = pos_for_task.lock().unwrap();
+                    if file.seek(SeekFrom::Start(*current_pos)).is_err() {
+                        continue;
+                    }
                     let mut reader = BufReader::new(&file);
                     let mut new_pos = *current_pos;
-                    let mut new_events: Vec<ParsedEvent> = Vec::new();
+                    let mut events: Vec<ParsedEvent> = Vec::new();
 
                     loop {
                         let mut raw_line = String::new();
@@ -339,10 +346,11 @@ async fn start_watching(app: AppHandle, log_path: String) -> Result<(), String> 
                                         if let Some(zone) = ev.zone.clone() {
                                             let state: State<Arc<Mutex<AppState>>> =
                                                 app_for_task.state();
-                                            let st = state.lock().unwrap();
-                                            st.watcher.lock().unwrap().current_zone =
-                                                Some(zone.clone());
-                                            drop(st);
+                                            {
+                                                let st = state.lock().unwrap();
+                                                st.watcher.lock().unwrap().current_zone =
+                                                    Some(zone.clone());
+                                            }
                                             refresh_tray(
                                                 &app_for_task,
                                                 true,
@@ -352,7 +360,7 @@ async fn start_watching(app: AppHandle, log_path: String) -> Result<(), String> 
                                             );
                                         }
                                     }
-                                    new_events.push(ev);
+                                    events.push(ev);
                                 }
                             }
                             Err(_) => break,
@@ -360,17 +368,17 @@ async fn start_watching(app: AppHandle, log_path: String) -> Result<(), String> 
                     }
 
                     *current_pos = new_pos;
-                    drop(current_pos);
+                    events
+                }; // current_pos MutexGuard dropped here
 
-                    if !new_events.is_empty() {
-                        refresh_tray(&app_for_task, true, None, None, true);
-                    }
-                    for ev in new_events {
-                        engine_for_task.enqueue(ev).await;
-                    }
-                    // After flushing queue, refresh tray back to watching state
-                    refresh_tray(&app_for_task, true, None, None, false);
+                if !new_events.is_empty() {
+                    refresh_tray(&app_for_task, true, None, None, true);
                 }
+                for ev in new_events {
+                    engine_for_task.enqueue(ev).await;
+                }
+                // After flushing queue, refresh tray back to watching state
+                refresh_tray(&app_for_task, true, None, None, false);
             }
         }
     });
@@ -446,7 +454,7 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     update
         .download_and_install(
             move |chunk, total| {
-                downloaded += chunk;
+                downloaded += chunk as u64;
                 let _ = app_for_progress.emit(
                     "update-progress",
                     serde_json::json!({ "downloaded": downloaded, "total": total }),
