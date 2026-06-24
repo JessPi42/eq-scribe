@@ -179,11 +179,11 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String>
     store.set(KEY_API_BASE_URL, serde_json::Value::String(settings.api_base_url.clone()));
     store.save().map_err(|e| e.to_string())?;
 
-    let state: State<Arc<Mutex<AppState>>> = app.state();
-    let st = state.lock().unwrap();
-    if let Some(ref engine) = st.sync_engine {
-        let engine = engine.clone();
-        drop(st);
+    let engine_opt = {
+        let st = state.lock().unwrap();
+        st.sync_engine.clone()
+    };
+    if let Some(engine) = engine_opt {
         engine.update_credentials(settings.api_key, settings.api_base_url).await;
     }
 
@@ -216,15 +216,16 @@ async fn test_connection(api_key: String, api_base_url: String) -> Result<serde_
 
 #[tauri::command]
 async fn get_status(app: AppHandle) -> AppStatus {
-    let state: State<Arc<Mutex<AppState>>> = app.state();
-    let st = state.lock().unwrap();
-    let watching = st.watcher.lock().unwrap().watching;
-    let current_zone = st.watcher.lock().unwrap().current_zone.clone();
-    let connected = st.connected;
+    let (watching, current_zone, connected, engine_opt) = {
+        let st = app.state::<Arc<Mutex<AppState>>>().lock().unwrap();
+        let watching = st.watcher.lock().unwrap().watching;
+        let current_zone = st.watcher.lock().unwrap().current_zone.clone();
+        let connected = st.connected;
+        let engine_opt = st.sync_engine.clone();
+        (watching, current_zone, connected, engine_opt)
+    };
 
-    if let Some(ref engine) = st.sync_engine {
-        let engine = engine.clone();
-        drop(st);
+    if let Some(engine) = engine_opt {
         let pending_events = engine.pending_count().await;
         let last_sync = engine.last_sync.lock().await.clone();
         let last_error = engine.last_error.lock().await.clone();
@@ -258,7 +259,6 @@ async fn get_status(app: AppHandle) -> AppStatus {
             current_zone,
         }
     } else {
-        drop(st);
         AppStatus {
             watching,
             tray_status: TrayStatus::Idle,
