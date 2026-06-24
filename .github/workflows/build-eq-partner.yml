@@ -105,29 +105,108 @@ jobs:
         shell: pwsh
         run: |
           $bundle = "artifacts/eq-partner-client/src-tauri/target/release/bundle/nsis"
-
           $exe = Get-ChildItem -Recurse $bundle -Filter "*-setup.exe" | Select-Object -First 1
           if (-not $exe) { Write-Error "No NSIS installer found under $bundle"; exit 1 }
           Write-Host "Found installer: $($exe.FullName)"
           echo "exe_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          $version = $exe.Name -replace '^.*_(\d+\.\d+\.\d+)_.*$', '$1'
+          echo "version=$version" >> $env:GITHUB_OUTPUT
 
-          $zip = Get-ChildItem -Recurse $bundle -Filter "*.nsis.zip" | Select-Object -First 1
-          if ($zip) {
-            Write-Host "Found updater zip: $($zip.FullName)"
-            echo "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
-            echo "zip_name=$($zip.Name)" >> $env:GITHUB_OUTPUT
-
-            $sig = Get-ChildItem -Recurse $bundle -Filter "*.nsis.zip.sig" | Select-Object -First 1
-            if ($sig) {
-              $sigContent = Get-Content $sig.FullName -Raw
-              echo "zip_sig=$($sigContent.Trim())" >> $env:GITHUB_OUTPUT
-              Write-Host "Found signature: $($sig.FullName)"
-            } else {
-              Write-Host "::warning::No .nsis.zip.sig found — updater bundles will not be signed."
-            }
-          } else {
-            Write-Host "::warning::No .nsis.zip found — auto-updater bundle was not produced."
+      - name: Create and sign updater bundle
+        id: sign_bundle
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            Write-Host "::warning::TAURI_SIGNING_PRIVATE_KEY not set — skipping updater bundle."
+            echo "zip_path=" >> $env:GITHUB_OUTPUT
+            exit 0
           }
+
+          $exePath  = "${{ steps.find_artifacts.outputs.exe_path }}"
+          $version  = "${{ steps.find_artifacts.outputs.version }}"
+          $zipName  = "EQ Partner_${version}_x64-setup.nsis.zip"
+          $zipPath  = Join-Path (Split-Path $exePath) $zipName
+          $sigPath  = "$zipPath.sig"
+
+          # Create zip of the installer
+          Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
+          Write-Host "Created updater zip: $zipPath"
+
+          # Sign using Node.js (Ed25519 + minisign format, written to temp file for reliability)
+          $scriptPath = Join-Path $env:RUNNER_TEMP "sign-bundle.mjs"
+          @'
+import { createPrivateKey, sign } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { basename } from 'node:path';
+
+const keyContent = process.env.TAURI_SIGNING_PRIVATE_KEY;
+if (!keyContent) { console.error('TAURI_SIGNING_PRIVATE_KEY not set'); process.exit(1); }
+
+// Parse minisign secret key: find the base64 line (not the comment)
+const b64Line = keyContent.trim().split('\n').find(l => !l.startsWith('untrusted comment'));
+if (!b64Line) { console.error('Cannot parse key'); process.exit(1); }
+
+const keyBytes = Buffer.from(b64Line.trim(), 'base64');
+// Layout: algo(2)+kdf(2)+cksum(2)+salt(32)+ops(8)+mem(8) = 54 bytes, then keynum_sk: key_id(8)+ed25519_sk(64)+chk(32)
+if (keyBytes.length < 158) { console.error('Key too short:', keyBytes.length); process.exit(1); }
+const keyId  = keyBytes.slice(54, 62);   // 8 bytes
+const seed   = keyBytes.slice(62, 94);   // 32-byte Ed25519 seed (first half of libsodium sk)
+
+// Build PKCS8 DER for Ed25519: fixed 16-byte header + 32-byte seed
+const pkcs8Header = Buffer.from('302e020100300506032b657004220420', 'hex');
+const pkcs8Der = Buffer.concat([pkcs8Header, seed]);
+const privKey = createPrivateKey({ key: pkcs8Der, format: 'der', type: 'pkcs8' });
+
+const zipPath = process.argv[2];
+if (!zipPath) { console.error('Usage: sign-bundle.mjs <zip-path>'); process.exit(1); }
+const zipData = readFileSync(zipPath);
+
+// Ed25519 signature of the file content
+const rawSig = sign(null, zipData, privKey);
+console.log('rawSig length:', rawSig.length, '(expected 64)');
+
+// minisign SigStruct: algo(2) + keyId(8) + rawSig(64) = 74 bytes
+const sigStruct = Buffer.concat([Buffer.from([0x45, 0x64]), keyId, rawSig]);
+const sigB64 = sigStruct.toString('base64');
+
+// Trusted comment (timestamp + filename)
+const ts = Math.floor(Date.now() / 1000);
+const filename = basename(zipPath);
+const trustedContent = `timestamp:${ts}\tfile:${filename}`;
+
+// Global sig: sign(rawSig || trustedContent)
+const globalInput = Buffer.concat([rawSig, Buffer.from(trustedContent)]);
+const globalSig = sign(null, globalInput, privKey);
+
+const sigFile = [
+  'untrusted comment: signature from minisign secret key',
+  sigB64,
+  `trusted comment: ${trustedContent}`,
+  globalSig.toString('base64'),
+  '',
+].join('\n');
+
+writeFileSync(zipPath + '.sig', sigFile);
+console.log('Signed successfully:', zipPath);
+console.log('SigB64:', sigB64);
+'@ | Set-Content $scriptPath -Encoding UTF8
+
+          node $scriptPath $zipPath
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing failed"; exit 1 }
+          Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+
+          $sigContent = Get-Content $sigPath -Raw
+          # Extract just the signature base64 line (second line of the .sig file)
+          $sigLines = $sigContent -split "`n"
+          $sigB64 = $sigLines[1].Trim()
+
+          Write-Host "Updater zip:  $zipPath"
+          Write-Host "Signature:    $sigPath"
+          echo "zip_path=$zipPath"     >> $env:GITHUB_OUTPUT
+          echo "zip_name=$zipName"     >> $env:GITHUB_OUTPUT
+          echo "zip_sig=$sigB64"       >> $env:GITHUB_OUTPUT
 
       - name: Sign installer (Authenticode)
         shell: pwsh
@@ -211,8 +290,8 @@ jobs:
             "eq-partner-v$version"
           }
 
-          $zipName = "${{ steps.find_artifacts.outputs.zip_name }}"
-          $sig     = "${{ steps.find_artifacts.outputs.zip_sig }}"
+          $zipName = "${{ steps.sign_bundle.outputs.zip_name }}"
+          $sig     = "${{ steps.sign_bundle.outputs.zip_sig }}"
 
           if (-not $zipName -or -not $sig) {
             if ($isRelease) {
@@ -278,13 +357,13 @@ jobs:
           retention-days: 90
 
       - name: Upload updater bundle as workflow artifact
-        if: steps.find_artifacts.outputs.zip_path != ''
+        if: steps.sign_bundle.outputs.zip_path != ''
         uses: actions/upload-artifact@v4
         with:
           name: eq-partner-updater-bundle
           path: |
-            ${{ steps.find_artifacts.outputs.zip_path }}
-            ${{ steps.find_artifacts.outputs.zip_path }}.sig
+            ${{ steps.sign_bundle.outputs.zip_path }}
+            ${{ steps.sign_bundle.outputs.zip_path }}.sig
           retention-days: 90
 
       - name: Create or update GitHub Release
@@ -304,6 +383,6 @@ jobs:
             **Auto-update:** The app checks for updates on launch and notifies you when a new version is available.
           files: |
             artifacts/api-server/public/partner/eq-partner.exe
-            ${{ steps.find_artifacts.outputs.zip_path }}
-            ${{ steps.find_artifacts.outputs.zip_path }}.sig
+            ${{ steps.sign_bundle.outputs.zip_path }}
+            ${{ steps.sign_bundle.outputs.zip_path }}.sig
             artifacts/api-server/public/partner/latest.json
