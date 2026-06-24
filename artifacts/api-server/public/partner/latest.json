@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "notes": "See the release page for details.",
+  "pub_date": "2026-06-24T16:51:56Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "RWRtwKBJqwAJ8O83G2qaaY8Poaf7R9+Ci/ZJufi/mC1yV9cyDXLB92L0XWMewb3ksNeoLmk4PPE5MG8CJ8KN75IygWE/UCKALgc=",
+      "url": "https://github.com/JessPi42/eq-scribe/releases/download/main/EQ Partner_0.1.0_x64-setup.nsis.zip"
+    }
+  }
+}
