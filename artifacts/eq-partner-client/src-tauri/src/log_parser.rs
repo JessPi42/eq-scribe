@@ -129,7 +129,7 @@ fn extract_keywords(text: &str) -> Vec<String> {
         "dost", "know", "need", "must", "come", "back", "many", "much",
     ];
     let mut seen = std::collections::HashSet::new();
-    let mut keywords: Vec<String> = text
+    let keywords: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
         .filter(|w| w.len() >= 4)
         .filter(|w| !STOP_WORDS.contains(&w.to_lowercase().as_str()))
